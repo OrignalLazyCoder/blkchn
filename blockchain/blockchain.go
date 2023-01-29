@@ -1,40 +1,137 @@
 package blockchain
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"os"
+	"runtime"
 
 	"github.com/dgraph-io/badger"
 )
 
-const dbPath = "./tmp/blocks"
+const (
+	dbPath      = "./tmp/blocks"
+	dbFile      = "./tmp/blocks/MANIFEST"          // This can be used to verify that the blockchain exists
+	genesisData = "First Transaction from Genesis" // This is arbitrary data for our genesis data
+)
 
+//BlockChain is an array of block pointers
+type BlockChain struct {
+	LastHash []byte
+	Database *badger.DB
+}
 type BlockChainIterator struct {
 	CurrentHash []byte
 	Database    *badger.DB
 }
 
-type BlockChain struct {
-	LastHash []byte
-	Database *badger.DB
+func DBexists() bool {
+	if _, err := os.Stat(dbFile); os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
-type Block struct {
-	Hash     []byte
-	Data     []byte
-	PrevHash []byte
-	Nonce    int
+//ContinueBlockChain will be called to append to an existing blockchain
+func ContinueBlockChain(address string) *BlockChain {
+	if !DBexists() {
+		fmt.Println("No blockchain found, please create one first")
+		runtime.Goexit()
+	}
+
+	var lastHash []byte
+
+	opts := badger.DefaultOptions(dbPath)
+	db, err := badger.Open(opts)
+	Handle(err)
+
+	err = db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("lh"))
+		Handle(err)
+		err = item.Value(func(val []byte) error {
+			lastHash = val
+			return nil
+		})
+		Handle(err)
+		return err
+	})
+	Handle(err)
+
+	chain := BlockChain{lastHash, db}
+	return &chain
 }
 
+//InitBlockChain will be what starts a new blockChain
+func InitBlockChain(address string) *BlockChain {
+	var lastHash []byte
+
+	if DBexists() {
+		fmt.Println("blockchain already exists")
+		runtime.Goexit()
+	}
+
+	opts := badger.DefaultOptions(dbPath)
+	db, err := badger.Open(opts)
+	Handle(err)
+
+	err = db.Update(func(txn *badger.Txn) error {
+
+		cbtx := CoinbaseTx(address, genesisData)
+		genesis := Genesis(cbtx)
+		fmt.Println("Genesis Created")
+		err = txn.Set(genesis.Hash, genesis.Serialize())
+		Handle(err)
+		err = txn.Set([]byte("lh"), genesis.Hash)
+
+		lastHash = genesis.Hash
+
+		return err
+
+	})
+
+	Handle(err)
+
+	blockchain := BlockChain{lastHash, db}
+	return &blockchain
+}
+
+// AddBlock Will add a Block type unit to a blockchain
+func (chain *BlockChain) AddBlock(transactions []*Transaction) {
+	var lastHash []byte
+
+	err := chain.Database.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("lh"))
+		Handle(err)
+		err = item.Value(func(val []byte) error {
+			lastHash = val
+			return nil
+		})
+		Handle(err)
+		return err
+	})
+	Handle(err)
+
+	newBlock := CreateBlock(transactions, lastHash)
+	err = chain.Database.Update(func(transaction *badger.Txn) error {
+		err := transaction.Set(newBlock.Hash, newBlock.Serialize())
+		Handle(err)
+		err = transaction.Set([]byte("lh"), newBlock.Hash)
+
+		chain.LastHash = newBlock.Hash
+		return err
+	})
+	Handle(err)
+}
+
+// Iterator takes our BlockChain struct and returns it as a BlockCHainIterator struct
 func (chain *BlockChain) Iterator() *BlockChainIterator {
 	iterator := BlockChainIterator{chain.LastHash, chain.Database}
 
 	return &iterator
 }
 
+// Next will iterate through the BlockChainIterator
 func (iterator *BlockChainIterator) Next() *Block {
 	var block *Block
 
@@ -55,120 +152,87 @@ func (iterator *BlockChainIterator) Next() *Block {
 
 	return block
 }
+func (chain *BlockChain) FindUnspentTransactions(address string) []Transaction {
+	var unspentTxs []Transaction
 
-func (b *Block) DeriveHash() {
-	info := bytes.Join([][]byte{b.Data, b.PrevHash}, []byte{})
-	// This will join our previous block's relevant info with the new blocks
-	hash := sha256.Sum256(info)
-	//This performs the actual hashing algorithm
-	b.Hash = hash[:]
-	//If this ^ doesn't make sense, you can look up slice defaults
-}
+	spentTXOs := make(map[string][]int)
 
-func CreateBlock(data string, prevHash []byte) *Block {
-	block := &Block{[]byte{}, []byte(data), prevHash, 0}
-	block.DeriveHash()
-	return block
-}
+	iter := chain.Iterator()
 
-func (chain *BlockChain) AddBlock(data string) {
-	var lastHash []byte
+	for {
+		block := iter.Next()
 
-	err := chain.Database.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte("lh"))
-		Handle(err)
-		err = item.Value(func(val []byte) error {
-			lastHash = val
-			return nil
-		})
-		Handle(err)
-		return err
-	})
-	Handle(err)
+		for _, tx := range block.Transactions {
+			txID := hex.EncodeToString(tx.ID)
 
-	newBlock := CreateBlock(data, lastHash)
-
-	err = chain.Database.Update(func(transaction *badger.Txn) error {
-		err := transaction.Set(newBlock.Hash, newBlock.Serialize())
-		Handle(err)
-		err = transaction.Set([]byte("lh"), newBlock.Hash)
-
-		chain.LastHash = newBlock.Hash
-		return err
-	})
-	Handle(err)
-}
-
-func Genesis() *Block {
-	return CreateBlock("Genesis", []byte{})
-}
-
-func InitBlockChain() *BlockChain {
-	var lastHash []byte
-
-	opts := badger.DefaultOptions(dbPath)
-
-	db, err := badger.Open(opts)
-	Handle(err)
-	//part 1 finished
-
-	err = db.Update(func(txn *badger.Txn) error {
-		// "lh" stand for last hash
-		if _, err := txn.Get([]byte("lh")); err == badger.ErrKeyNotFound {
-			fmt.Println("No existing blockchain found")
-			genesis := Genesis()
-			fmt.Println("Genesis proved")
-			err = txn.Set(genesis.Hash, genesis.Serialize())
-			Handle(err)
-			err = txn.Set([]byte("lh"), genesis.Hash)
-
-			lastHash = genesis.Hash
-
-			return err
-			//part 2/3 finished
-		} else {
-			item, err := txn.Get([]byte("lh"))
-			Handle(err)
-			err = item.Value(func(val []byte) error {
-				lastHash = val
-				return nil
-			})
-			Handle(err)
-			return err
+		Outputs:
+			for outIdx, out := range tx.Outputs {
+				if spentTXOs[txID] != nil {
+					for _, spentOut := range spentTXOs[txID] {
+						if spentOut == outIdx {
+							continue Outputs
+						}
+					}
+				}
+				if out.CanBeUnlocked(address) {
+					unspentTxs = append(unspentTxs, *tx)
+				}
+			}
+			if !tx.IsCoinbase() {
+				for _, in := range tx.Inputs {
+					if in.CanUnlock(address) {
+						inTxID := hex.EncodeToString(in.ID)
+						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.Out)
+					}
+				}
+			}
 		}
-	})
-	Handle(err)
 
-	blockchain := BlockChain{lastHash, db}
-	return &blockchain
-	//that's everything!
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+	return unspentTxs
+}
+
+func (chain *BlockChain) FindUTXO(address string) []TxOutput {
+	var UTXOs []TxOutput
+	unspentTransactions := chain.FindUnspentTransactions(address)
+	for _, tx := range unspentTransactions {
+		for _, out := range tx.Outputs {
+			if out.CanBeUnlocked(address) {
+				UTXOs = append(UTXOs, out)
+			}
+		}
+	}
+
+	return UTXOs
+}
+
+func (chain *BlockChain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
+	unspentOuts := make(map[string][]int)
+	unspentTxs := chain.FindUnspentTransactions(address)
+	accumulated := 0
+
+Work:
+	for _, tx := range unspentTxs {
+		txID := hex.EncodeToString(tx.ID)
+		for outIdx, out := range tx.Outputs {
+			if out.CanBeUnlocked(address) && accumulated < amount {
+				accumulated += out.Value
+				unspentOuts[txID] = append(unspentOuts[txID], outIdx)
+
+				if accumulated >= amount {
+					break Work
+				}
+			}
+		}
+	}
+	return accumulated, unspentOuts
 }
 
 func Handle(err error) {
 	if err != nil {
 		log.Panic(err)
 	}
-}
-
-func (b *Block) Serialize() []byte {
-	var res bytes.Buffer
-	encoder := gob.NewEncoder(&res)
-
-	err := encoder.Encode(b)
-
-	Handle(err)
-
-	return res.Bytes()
-}
-
-func Deserialize(data []byte) *Block {
-	var block Block
-
-	decoder := gob.NewDecoder(bytes.NewReader(data))
-
-	err := decoder.Decode(&block)
-
-	Handle(err)
-
-	return &block
 }
